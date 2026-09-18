@@ -210,6 +210,19 @@ void vdagent_display_send_daemon_guest_res(VDAgentDisplay *display, gboolean upd
     // Finally we try X11. This is the default, and should work OK in most circumstances.
     res_array = vdagent_mutter_get_resolutions(display->mutter, &width, &height, &screen_count);
 
+    /* niri owns org.gnome.Mutter.DisplayConfig to back its ScreenCast and
+     * ServiceChannel interfaces, but its GetCurrentState reports no monitors
+     * at all. That is a successful call returning an empty array rather than
+     * NULL, so it shadows the GTK backend, which can see the outputs. Treat a
+     * reply carrying no usable geometry as a miss. */
+    if (res_array != NULL && (res_array->len == 0 || width == 0 || height == 0)) {
+        g_array_free(res_array, TRUE);
+        res_array = NULL;
+        width = 0;
+        height = 0;
+        screen_count = 0;
+    }
+
     if (res_array == NULL) {
         res_array = vdagent_gtk_get_resolutions(display, &width, &height, &screen_count);
     }
