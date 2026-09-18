@@ -22,6 +22,7 @@
 # include <gdk/wayland/gdkwayland.h>
 # include <gio/gio.h>
 # include <gio/gunixinputstream.h>
+# include <gio/gunixoutputstream.h>
 # include <string.h>
 # include <syslog.h>
 # include <unistd.h>
@@ -149,8 +150,22 @@ typedef struct {
      * tell "the guest just copied something" apart from "we just wrote
      * the host's clipboard" on its own. Set right before every
      * gdk_clipboard_set_content() call and consumed by the very next
-     * data_control_selection callback, which is that write's own echo. */
+     * data_control_selection callback, which is that write's own echo.
+     * Only used on the GdkClipboard fallback path below: when the write
+     * goes out over data-control we own the selection outright, and
+     * sel->source is a far sturdier way to recognise our own echo. */
     gboolean      expect_own_selection;
+
+    /* write side over data-control. Setting a selection through the
+     * ordinary wl_data_device -- which is all GdkClipboard can do -- needs
+     * a serial from an input event the client received, and a headless
+     * agent with no surface never has one, so on a compositor that checks
+     * (niri does) gdk_clipboard_set_content() silently owns nothing.
+     * zwlr_data_control_device_v1 exists precisely to let a focus-less
+     * client take the selection, so prefer it and keep GdkClipboard as the
+     * fallback for compositors without the protocol. */
+    struct zwlr_data_control_source_v1 *source; /* ours while owner == OWNER_CLIENT */
+    GList        *sends_to_guest;               /* PendingSend*, awaiting client data */
 } Selection;
 
 #define VDAGENT_TYPE_CLIPBOARD_PROVIDER (vdagent_clipboard_provider_get_type())
@@ -289,6 +304,112 @@ static void clipboard_new_owner(VDAgentClipboards *c, guint sel_id, guint new_ow
     sel->owner = new_owner;
 }
 
+/* ---- write side over data-control (see the Selection comment) ---- */
+
+/* One guest application waiting on the read end of a pipe while we fetch
+ * the data it asked for from the client. */
+typedef struct {
+    guint          type;
+    GOutputStream *stream; /* the pipe fd the compositor handed us */
+} PendingSend;
+
+static void pending_send_free(PendingSend *ps)
+{
+    g_clear_object(&ps->stream);
+    g_free(ps);
+}
+
+/* Drop our source and fail anything still waiting on it. Safe to call when
+ * we do not currently own the selection. */
+static void clipboard_source_clear(VDAgentClipboards *c, guint sel_id)
+{
+    Selection *sel = &c->selections[sel_id];
+
+    g_list_free_full(g_steal_pointer(&sel->sends_to_guest),
+                     (GDestroyNotify)pending_send_free);
+    g_clear_pointer(&sel->source, zwlr_data_control_source_v1_destroy);
+}
+
+static void data_control_send_written_cb(GObject *source, GAsyncResult *result,
+                                         gpointer user_data)
+{
+    GOutputStream *stream = G_OUTPUT_STREAM(source);
+    GBytes *bytes = user_data;
+    GError *error = NULL;
+
+    if (!g_output_stream_write_all_finish(stream, result, NULL, &error)) {
+        syslog(LOG_WARNING, "%s: %s", __func__,
+               error ? error->message : "write failed");
+        g_clear_error(&error);
+    }
+    g_bytes_unref(bytes);
+    /* Closing is what tells the reader the selection data has ended. */
+    g_output_stream_close(stream, NULL, NULL);
+    g_object_unref(stream);
+}
+
+/* A guest application is pasting: the compositor hands us the mime type it
+ * wants and a pipe to write it into. The data lives on the client, so ask
+ * for it and answer once vdagent_clipboard_data() brings it back. */
+static void data_control_source_send(void *data, struct zwlr_data_control_source_v1 *source,
+                                     const char *mime_type, int32_t fd)
+{
+    VDAgentClipboards *c = data;
+
+    for (guint sel_id = 0; sel_id < SELECTION_COUNT; sel_id++) {
+        Selection *sel = &c->selections[sel_id];
+        if (sel->source != source) {
+            continue;
+        }
+
+        guint type = type_from_mime_type(mime_type);
+        if (type == VD_AGENT_CLIPBOARD_NONE || !sel->type_available[type]) {
+            syslog(LOG_WARNING, "%s: sel_id=%u: guest asked for unoffered type %s",
+                   __func__, sel_id, mime_type);
+            close(fd);
+            return;
+        }
+
+        PendingSend *ps = g_new0(PendingSend, 1);
+        ps->type = type;
+        ps->stream = g_unix_output_stream_new(fd, TRUE);
+        sel->sends_to_guest = g_list_append(sel->sends_to_guest, ps);
+
+        udscs_write(c->conn, VDAGENTD_CLIPBOARD_REQUEST, sel_id, type, NULL, 0);
+        return;
+    }
+
+    /* A source we have already replaced; nothing can answer for it. */
+    close(fd);
+}
+
+static void data_control_source_cancelled(void *data,
+                                          struct zwlr_data_control_source_v1 *source)
+{
+    VDAgentClipboards *c = data;
+
+    for (guint sel_id = 0; sel_id < SELECTION_COUNT; sel_id++) {
+        Selection *sel = &c->selections[sel_id];
+        if (sel->source != source) {
+            continue;
+        }
+        /* Someone else took the selection. Release ownership before the
+         * selection event for the new owner arrives, so that event is read
+         * as a genuine guest copy rather than suppressed as our own echo.
+         */
+        clipboard_source_clear(c, sel_id);
+        clipboard_new_owner(c, sel_id, OWNER_NONE);
+        return;
+    }
+
+    zwlr_data_control_source_v1_destroy(source);
+}
+
+static const struct zwlr_data_control_source_v1_listener source_listener = {
+    data_control_source_send,
+    data_control_source_cancelled,
+};
+
 /* ---- observe side: wlr-data-control (see the file-level comment) ---- */
 
 static void data_control_offer_offer(void *data, struct zwlr_data_control_offer_v1 *offer,
@@ -343,12 +464,21 @@ static void data_control_offer_finalized(VDAgentClipboards *c, guint sel_id,
         g_clear_pointer(&sel->current_mime[type], g_free);
     }
 
-    if (sel->expect_own_selection) {
+    if ((sel->owner == OWNER_CLIENT && sel->source) || sel->expect_own_selection) {
         /* echo of our own vdagent_clipboard_grab() -- not a real guest
          * change. We still have to consume/destroy the offer object (it's
          * real, just uninteresting) and drop whatever mime types this
          * offer accumulated, but must not treat it as GUEST taking
-         * ownership. */
+         * ownership.
+         *
+         * While the selection is ours over data-control, sel->source says
+         * so for as long as it stays ours, rather than for exactly one
+         * event: the compositor re-announces the selection more than once
+         * in practice, and a one-shot flag lets the second announcement
+         * through as a phantom guest copy, which we then grab straight
+         * back to the client in an endless loop. Ownership ends at the
+         * source's cancelled event, which fires before the new owner's
+         * selection event. */
         sel->expect_own_selection = FALSE;
         for (guint type = 0; type < TYPE_COUNT; type++) {
             g_clear_pointer(&c->pending_mime[type], g_free);
@@ -502,15 +632,54 @@ void vdagent_clipboard_grab(VDAgentClipboards *c, guint sel_id,
         return;
     }
 
-    VdagentClipboardProvider *provider =
-        g_object_new(VDAGENT_TYPE_CLIPBOARD_PROVIDER, NULL);
-    provider->clipboards = c;
-    provider->sel_id = sel_id;
+    if (c->data_control_device) {
+        gboolean primary = (sel_id == VD_AGENT_CLIPBOARD_SELECTION_PRIMARY);
 
-    sel->expect_own_selection = TRUE;
-    gdk_clipboard_set_content(sel->clipboard, GDK_CONTENT_PROVIDER(provider));
-    g_object_unref(provider);
-    clipboard_new_owner(c, sel_id, OWNER_CLIENT);
+        if (primary &&
+            wl_proxy_get_version((struct wl_proxy *)c->data_control_device) <
+                ZWLR_DATA_CONTROL_DEVICE_V1_SET_PRIMARY_SELECTION_SINCE_VERSION) {
+            goto gdk_fallback;
+        }
+
+        /* Replacing our own selection: drop the previous source first, so
+         * its cancelled event cannot clear the ownership we are about to
+         * take. */
+        clipboard_source_clear(c, sel_id);
+
+        sel->source = zwlr_data_control_manager_v1_create_data_source(c->data_control_manager);
+        zwlr_data_control_source_v1_add_listener(sel->source, &source_listener, c);
+        for (guint type = 0; type < TYPE_COUNT; type++) {
+            if (sel->type_available[type]) {
+                zwlr_data_control_source_v1_offer(sel->source, mime_type_for_type(type));
+            }
+        }
+
+        /* Ownership has to be recorded before the request reaches the
+         * compositor, or the resulting selection event races us and is
+         * mistaken for a guest copy. */
+        clipboard_new_owner(c, sel_id, OWNER_CLIENT);
+
+        if (primary) {
+            zwlr_data_control_device_v1_set_primary_selection(c->data_control_device, sel->source);
+        } else {
+            zwlr_data_control_device_v1_set_selection(c->data_control_device, sel->source);
+        }
+        wl_display_flush(c->wl_display);
+        return;
+    }
+
+gdk_fallback:
+    {
+        VdagentClipboardProvider *provider =
+            g_object_new(VDAGENT_TYPE_CLIPBOARD_PROVIDER, NULL);
+        provider->clipboards = c;
+        provider->sel_id = sel_id;
+
+        sel->expect_own_selection = TRUE;
+        gdk_clipboard_set_content(sel->clipboard, GDK_CONTENT_PROVIDER(provider));
+        g_object_unref(provider);
+        clipboard_new_owner(c, sel_id, OWNER_CLIENT);
+    }
 #endif
 }
 
@@ -522,6 +691,34 @@ void vdagent_clipboard_data(VDAgentClipboards *c, guint sel_id,
 #else
     g_return_if_fail(sel_id < SELECTION_COUNT);
     Selection *sel = &c->selections[sel_id];
+
+    /* A guest application pasting through our data-control source is
+     * waiting on a pipe rather than on a GdkContentProvider task. */
+    for (GList *s = sel->sends_to_guest; s != NULL; s = s->next) {
+        PendingSend *ps = s->data;
+        if (ps->type != type) {
+            continue;
+        }
+        sel->sends_to_guest = g_list_delete_link(sel->sends_to_guest, s);
+
+        if (data == NULL || size == 0) {
+            /* Client had nothing for this type; an empty pipe says so. */
+            g_output_stream_close(ps->stream, NULL, NULL);
+            pending_send_free(ps);
+            return;
+        }
+
+        /* The buffer belongs to the caller and a pipe write can block on a
+         * slow reader, so take a copy and let it drain asynchronously. */
+        GBytes *bytes = g_bytes_new(data, size);
+        gsize len = 0;
+        gconstpointer buf = g_bytes_get_data(bytes, &len);
+        g_output_stream_write_all_async(ps->stream, buf, len, G_PRIORITY_DEFAULT,
+                                        NULL, data_control_send_written_cb, bytes);
+        ps->stream = NULL; /* the async write owns it now */
+        pending_send_free(ps);
+        return;
+    }
 
     /* Match by the type each request is actually waiting on, not queue
      * position -- more than one write_mime_type_async can be outstanding
@@ -564,8 +761,15 @@ void vdagent_clipboard_release(VDAgentClipboards *c, guint sel_id)
     if (c->selections[sel_id].owner != OWNER_CLIENT)
         return;
 
+    gboolean had_source = (c->selections[sel_id].source != NULL);
+    clipboard_source_clear(c, sel_id);
     clipboard_new_owner(c, sel_id, OWNER_NONE);
-    gdk_clipboard_set_content(c->selections[sel_id].clipboard, NULL);
+    if (had_source) {
+        /* Destroying the source already drops the selection. */
+        wl_display_flush(c->wl_display);
+    } else {
+        gdk_clipboard_set_content(c->selections[sel_id].clipboard, NULL);
+    }
 #endif
 }
 
@@ -578,8 +782,10 @@ void vdagent_clipboards_release_all(VDAgentClipboards *c)
 
     for (sel_id = 0; sel_id < SELECTION_COUNT; sel_id++) {
         owner = c->selections[sel_id].owner;
+        gboolean had_source = (c->selections[sel_id].source != NULL);
+        clipboard_source_clear(c, sel_id);
         clipboard_new_owner(c, sel_id, OWNER_NONE);
-        if (owner == OWNER_CLIENT)
+        if (owner == OWNER_CLIENT && !had_source)
             gdk_clipboard_set_content(c->selections[sel_id].clipboard, NULL);
         else if (owner == OWNER_GUEST && c->conn)
             udscs_write(c->conn, VDAGENTD_CLIPBOARD_RELEASE, sel_id, 0, NULL, 0);
