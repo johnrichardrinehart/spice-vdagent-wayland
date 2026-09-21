@@ -1,3 +1,15 @@
+spice-vdagent-wayland (0.23.2-1) unstable; urgency=medium
+
+  * Packaging-only release; no change to the agent itself, so the Debian
+    and RPM packages are functionally identical to 0.23.1. The Arch
+    package now installs spice-vdagentd to /usr/bin instead of shipping a
+    real /usr/sbin/ directory, which conflicted with the /usr/sbin symlink
+    owned by Arch's filesystem package and made 0.23.1 uninstallable with
+    pacman. CI now installs the built Arch package to catch this class of
+    failure before release.
+
+ -- spice-vdagent-wayland <noreply@github.com>  Mon, 21 Sep 2026 09:36:00 -0700
+
 spice-vdagent-wayland (0.23.1-1) unstable; urgency=medium
 
   * Fix guest resolution reporting on a fractionally-scaled Wayland
