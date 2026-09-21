@@ -51,7 +51,15 @@ build() {
 	# --prefix=/usr) is wrong for a real install -- nothing reads XDG autostart
 	# entries from /usr/etc, only /etc (verified: without this the .desktop
 	# lands at /usr/etc/xdg/autostart and silently never autostarts anything).
-	./autogen.sh --prefix=/usr --sysconfdir=/etc --with-gtk4=yes --with-init-script=systemd
+	#
+	# --sbindir=/usr/bin: Arch merges /usr/sbin into /usr/bin, so /usr/sbin is
+	# a symlink owned by the filesystem package. autotools' default
+	# (${exec_prefix}/sbin) makes the package ship a real /usr/sbin/ directory,
+	# which pacman rejects at install time ("/usr/sbin exists in filesystem").
+	# The unit file's hardcoded ExecStart=/usr/sbin/spice-vdagentd still
+	# resolves, through that same symlink.
+	./autogen.sh --prefix=/usr --sysconfdir=/etc --sbindir=/usr/bin \
+		--with-gtk4=yes --with-init-script=systemd
 	make
 }
 
