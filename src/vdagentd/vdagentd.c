@@ -869,6 +869,25 @@ static void check_xorg_resolution(void)
             vdagent_connection_flush(VDAGENT_CONNECTION(virtio_port));
             g_clear_pointer(&virtio_port, vdagent_connection_destroy);
             syslog(LOG_INFO, "closed vdagent virtio channel");
+
+            /* Closing the channel ends the client's agent session: the
+             * server reports the agent as gone, and the client resets its
+             * clipboard grab serials. Forget that client here too. Left in
+             * place, its capabilities let the next session agent's
+             * clipboard grab - which it sends the moment it starts, before
+             * the client has answered the reopened channel - go out with a
+             * serial this side then resets when that answer arrives. The
+             * client has accepted the grab by then, so the two serials
+             * stay one apart and each side discards every grab the other
+             * sends, in both directions, until enough grabs pile up on the
+             * lagging side to close the gap. Without capabilities,
+             * do_agent_clipboard drops clipboard messages until the next
+             * client announces its own. */
+            do_client_disconnect();
+            g_clear_pointer(&capabilities, g_free);
+            capabilities_size = 0;
+            memset(clipboard_serial, 0, sizeof(clipboard_serial));
+            memset(agent_owns_clipboard, 0, sizeof(agent_owns_clipboard));
         }
     }
 }
