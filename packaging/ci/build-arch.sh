@@ -36,5 +36,20 @@ useradd -m builder
 chown -R builder:builder "$build_root"
 su builder -c "cd '$build_root' && makepkg --noconfirm --syncdeps"
 
+# Actually install what we just built, as a user would with `pacman -U`.
+# makepkg happily builds a package pacman then refuses to install -- e.g.
+# shipping a real /usr/sbin/ directory, which conflicts with the symlink
+# owned by the filesystem package. Only an install exercises pacman's
+# file-conflict and metadata checks. The -debug split package isn't what
+# users install, so it's skipped here (it's still published below).
+installed=0
+for pkg in "$build_root"/*.pkg.tar.zst; do
+	case "$pkg" in *-debug-*) continue ;; esac
+	pacman -U --noconfirm "$pkg"
+	installed=1
+done
+[ "$installed" = 1 ] || { echo "no installable package was built" >&2; exit 1; }
+test -x /usr/bin/spice-vdagentd
+
 mkdir -p "$out"
 cp "$build_root"/*.pkg.tar.zst "$out/"

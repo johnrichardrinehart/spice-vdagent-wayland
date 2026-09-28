@@ -1,5 +1,5 @@
 Name:           spice-vdagent-wayland
-Version:        0.23.1
+Version:        0.23.2
 Release:        1%{?dist}
 Summary:        SPICE agent for Linux guests, with native Wayland support
 
@@ -97,6 +97,11 @@ Fork of the official spice-vdagent adding native Wayland support:
 %{_sysconfdir}/xdg/autostart/spice-vdagent.desktop
 
 %changelog
+* Mon Sep 21 2026 spice-vdagent-wayland <noreply@github.com> - 0.23.2-1
+- Packaging-only release; no change to the agent itself. The Arch package
+  now installs spice-vdagentd to /usr/bin (0.23.1 shipped a real
+  /usr/sbin/ directory that pacman rejected as a conflict with the
+  filesystem package's symlink), and CI now test-installs it.
 * Sun Sep 06 2026 spice-vdagent-wayland <noreply@github.com> - 0.23.1-1
 - Fix guest resolution reporting on a fractionally-scaled Wayland
   compositor: gdk_monitor_get_geometry() returns logical pixels, not the
