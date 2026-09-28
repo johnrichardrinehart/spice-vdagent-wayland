@@ -49,16 +49,44 @@ struct VDAgentWlrOutputMgmt {
 };
 
 /* ---- zwlr_output_mode_v1: we only ever set_custom_mode(), never
- * set_mode(), so there is nothing worth tracking per mode -- destroy the
- * proxy as soon as it's introduced. It has no destroy request of its own
- * (no listener either -- it's a pure event source), so this is just
- * freeing our local client-side handle, not a wire message. */
+ * set_mode(), so nothing about a mode is worth tracking. The proxy still
+ * has to stay alive until the compositor says the mode is gone: a head's
+ * current_mode event names one of its modes by object id, and libwayland
+ * treats an id it no longer knows as a fatal protocol error. Destroying
+ * each mode as soon as it was introduced therefore took the whole agent
+ * down ("Error reading events from display: Invalid argument") on the
+ * first mode change after startup - which is every time the SPICE client
+ * resizes the guest. */
+
+static void mode_noop_size(void *d, struct zwlr_output_mode_v1 *m, int32_t w, int32_t h) { (void)d; (void)m; (void)w; (void)h; }
+static void mode_noop_refresh(void *d, struct zwlr_output_mode_v1 *m, int32_t r) { (void)d; (void)m; (void)r; }
+static void mode_noop_preferred(void *d, struct zwlr_output_mode_v1 *m) { (void)d; (void)m; }
+
+static void mode_finished(void *data, struct zwlr_output_mode_v1 *mode)
+{
+    (void)data;
+    /* release (v3) tells the compositor it may free its side too; before
+     * v3 there is no destructor request and destroy is client-side only. */
+    if (wl_proxy_get_version((struct wl_proxy *)mode) >=
+        ZWLR_OUTPUT_MODE_V1_RELEASE_SINCE_VERSION) {
+        zwlr_output_mode_v1_release(mode);
+    } else {
+        zwlr_output_mode_v1_destroy(mode);
+    }
+}
+
+static const struct zwlr_output_mode_v1_listener mode_listener = {
+    mode_noop_size,
+    mode_noop_refresh,
+    mode_noop_preferred,
+    mode_finished,
+};
 
 static void head_mode(void *data, struct zwlr_output_head_v1 *head, struct zwlr_output_mode_v1 *mode)
 {
     (void)data;
     (void)head;
-    zwlr_output_mode_v1_destroy(mode);
+    zwlr_output_mode_v1_add_listener(mode, &mode_listener, NULL);
 }
 
 /* ---- zwlr_output_head_v1: only name/mode/finished carry real logic; the
