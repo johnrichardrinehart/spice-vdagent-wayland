@@ -124,6 +124,8 @@ enum {
     OWNER_CLIENT
 };
 
+typedef struct EchoCheck EchoCheck;
+
 typedef struct {
     /* write side (host -> guest): ordinary GdkClipboard */
     GdkClipboard *clipboard;
@@ -166,6 +168,21 @@ typedef struct {
      * fallback for compositors without the protocol. */
     struct zwlr_data_control_source_v1 *source; /* ours while owner == OWNER_CLIENT */
     GList        *sends_to_guest;               /* PendingSend*, awaiting client data */
+
+    /* A clipboard manager in the guest (wl-clip-persist, for one) reads
+     * every new selection and then takes the selection over with its own
+     * copy, so that the data outlives the application that offered it.
+     * When the selection it takes over is ours, that looks exactly like
+     * the guest copying what the client has just given us. Announcing it
+     * back would hand the client's clipboard to us: whatever formats the
+     * guest has no mime type for are gone (RTF on macOS, say), and the
+     * client's clipboard empties the moment this agent goes away.
+     *
+     * served holds the bytes of each type we last wrote to a guest reader
+     * for the client's current grab. An offer that could be that data
+     * coming back is read first and only announced if it differs. */
+    GBytes       *served[TYPE_COUNT];
+    EchoCheck    *echo_check; /* the comparison in flight for current_offer, if any */
 } Selection;
 
 #define VDAGENT_TYPE_CLIPBOARD_PROVIDER (vdagent_clipboard_provider_get_type())
@@ -330,6 +347,13 @@ static void clipboard_source_clear(VDAgentClipboards *c, guint sel_id)
     g_clear_pointer(&sel->source, zwlr_data_control_source_v1_destroy);
 }
 
+static void clipboard_served_clear(Selection *sel)
+{
+    for (guint type = 0; type < TYPE_COUNT; type++) {
+        g_clear_pointer(&sel->served[type], g_bytes_unref);
+    }
+}
+
 static void data_control_send_written_cb(GObject *source, GAsyncResult *result,
                                          gpointer user_data)
 {
@@ -448,6 +472,118 @@ static void data_control_data_offer(void *data, struct zwlr_data_control_device_
     zwlr_data_control_offer_v1_add_listener(offer, &offer_listener, c);
 }
 
+/* The guest really has copied something: tell the client, and forget what
+ * the client last gave us, since the client is about to hold this instead. */
+static void clipboard_announce_guest(VDAgentClipboards *c, guint sel_id,
+                                     const guint32 *types, guint n_types)
+{
+    Selection *sel = &c->selections[sel_id];
+
+    clipboard_served_clear(sel);
+    clipboard_new_owner(c, sel_id, OWNER_GUEST);
+    udscs_write(c->conn, VDAGENTD_CLIPBOARD_GRAB, sel_id, 0,
+               (guint8 *)types, n_types * sizeof(guint32));
+}
+
+struct EchoCheck {
+    VDAgentClipboards *c;
+    guint sel_id;
+    guint type;                 /* the one being compared */
+    guint32 types[TYPE_COUNT];  /* everything the offer carries, to announce */
+    guint n_types;
+};
+
+/* Which type to compare, or NONE when the offer cannot be the client's
+ * data coming back: it carries something the client never offered, or we
+ * have served none of it. types is in ascending order, so UTF-8 text, the
+ * cheapest to read, wins whenever it was served. */
+static guint echo_check_type(Selection *sel, const guint32 *types, guint n_types)
+{
+    guint pick = VD_AGENT_CLIPBOARD_NONE;
+
+    for (guint i = 0; i < n_types; i++) {
+        if (!sel->type_available[types[i]]) {
+            return VD_AGENT_CLIPBOARD_NONE;
+        }
+        if (pick == VD_AGENT_CLIPBOARD_NONE && sel->served[types[i]]) {
+            pick = types[i];
+        }
+    }
+    return pick;
+}
+
+static void echo_check_done_cb(GObject *source, GAsyncResult *result, gpointer user_data)
+{
+    EchoCheck *chk = user_data;
+    Selection *sel = &chk->c->selections[chk->sel_id];
+    GOutputStream *sink = G_OUTPUT_STREAM(source);
+    GError *error = NULL;
+
+    gssize spliced = g_output_stream_splice_finish(sink, result, &error);
+    if (spliced < 0) {
+        syslog(LOG_WARNING, "%s: sel_id=%u: %s", __func__, chk->sel_id,
+               error ? error->message : "splice failed");
+        g_clear_error(&error);
+    }
+
+    /* A later selection, or a grab from the client, has replaced the offer
+     * this was reading; whatever the answer, it no longer matters. */
+    if (sel->echo_check != chk) {
+        goto done;
+    }
+    sel->echo_check = NULL;
+
+    GBytes *served = sel->served[chk->type];
+    gsize size = g_memory_output_stream_get_data_size(G_MEMORY_OUTPUT_STREAM(sink));
+    if (spliced >= 0 && served && size == g_bytes_get_size(served) &&
+        (size == 0 ||
+         memcmp(g_memory_output_stream_get_data(G_MEMORY_OUTPUT_STREAM(sink)),
+                g_bytes_get_data(served, NULL), size) == 0)) {
+        /* The client still holds this very data; leave its clipboard be. */
+        syslog(LOG_DEBUG, "%s: sel_id=%u: guest re-offered the client's own data, "
+                          "not announcing it", __func__, chk->sel_id);
+        goto done;
+    }
+
+    clipboard_announce_guest(chk->c, chk->sel_id, chk->types, chk->n_types);
+
+done:
+    g_object_unref(sink);
+    g_free(chk);
+}
+
+/* Reads sel->current_offer's `type` and announces the offer only if it is
+ * not what we served the guest. FALSE if the read could not be started. */
+static gboolean echo_check_start(VDAgentClipboards *c, guint sel_id, guint type,
+                                 const guint32 *types, guint n_types)
+{
+    Selection *sel = &c->selections[sel_id];
+    int pipe_fds[2];
+
+    if (pipe(pipe_fds) != 0) {
+        syslog(LOG_WARNING, "%s: sel_id=%u: pipe() failed", __func__, sel_id);
+        return FALSE;
+    }
+    zwlr_data_control_offer_v1_receive(sel->current_offer, sel->current_mime[type], pipe_fds[1]);
+    close(pipe_fds[1]);
+    wl_display_flush(c->wl_display);
+
+    EchoCheck *chk = g_new0(EchoCheck, 1);
+    chk->c = c;
+    chk->sel_id = sel_id;
+    chk->type = type;
+    memcpy(chk->types, types, n_types * sizeof(guint32));
+    chk->n_types = n_types;
+    sel->echo_check = chk;
+
+    GInputStream *src = g_unix_input_stream_new(pipe_fds[0], TRUE);
+    GOutputStream *sink = g_memory_output_stream_new_resizable();
+    g_output_stream_splice_async(sink, src, G_OUTPUT_STREAM_SPLICE_CLOSE_SOURCE,
+                                 G_PRIORITY_DEFAULT, NULL, echo_check_done_cb, chk);
+    g_object_unref(src);
+    return TRUE;
+}
+
 /* Shared by data_control_selection (CLIPBOARD) and
  * data_control_primary_selection (PRIMARY) -- same finalize logic once
  * the sel_id is known, just applied to a different Selection slot. */
@@ -455,6 +591,9 @@ static void data_control_offer_finalized(VDAgentClipboards *c, guint sel_id,
                                           struct zwlr_data_control_offer_v1 *offer)
 {
     Selection *sel = &c->selections[sel_id];
+    /* Every selection event replaces whatever offer an echo check was
+     * reading. */
+    sel->echo_check = NULL;
 
     if (sel->current_offer) {
         zwlr_data_control_offer_v1_destroy(sel->current_offer);
@@ -515,9 +654,13 @@ static void data_control_offer_finalized(VDAgentClipboards *c, guint sel_id,
         return; /* nothing in a format we support (yet) */
     }
 
-    clipboard_new_owner(c, sel_id, OWNER_GUEST);
-    udscs_write(c->conn, VDAGENTD_CLIPBOARD_GRAB, sel_id, 0,
-               (guint8 *)types, n_types * sizeof(guint32));
+    guint check_type = echo_check_type(sel, types, n_types);
+    if (check_type != VD_AGENT_CLIPBOARD_NONE &&
+        echo_check_start(c, sel_id, check_type, types, n_types)) {
+        return;
+    }
+
+    clipboard_announce_guest(c, sel_id, types, n_types);
 }
 
 static void data_control_selection(void *data, struct zwlr_data_control_device_v1 *device,
@@ -617,6 +760,12 @@ void vdagent_clipboard_grab(VDAgentClipboards *c, guint sel_id,
     g_return_if_fail(sel_id < SELECTION_COUNT);
 
     Selection *sel = &c->selections[sel_id];
+    /* The client has new data: nothing we served before is the client's
+     * any more, and the guest offer an echo check was reading is about to
+     * be replaced by ours. */
+    sel->echo_check = NULL;
+    clipboard_served_clear(sel);
+
     for (guint type = 0; type < TYPE_COUNT; type++) {
         sel->type_available[type] = FALSE;
     }
@@ -701,8 +850,13 @@ void vdagent_clipboard_data(VDAgentClipboards *c, guint sel_id,
         }
         sel->sends_to_guest = g_list_delete_link(sel->sends_to_guest, s);
 
+        /* Served even when empty: a clipboard manager re-offers the empty
+         * text it read just the same, and announcing that would replace
+         * the client's clipboard with nothing. */
+        g_clear_pointer(&sel->served[type], g_bytes_unref);
         if (data == NULL || size == 0) {
             /* Client had nothing for this type; an empty pipe says so. */
+            sel->served[type] = g_bytes_new(NULL, 0);
             g_output_stream_close(ps->stream, NULL, NULL);
             pending_send_free(ps);
             return;
@@ -713,6 +867,7 @@ void vdagent_clipboard_data(VDAgentClipboards *c, guint sel_id,
         GBytes *bytes = g_bytes_new(data, size);
         gsize len = 0;
         gconstpointer buf = g_bytes_get_data(bytes, &len);
+        sel->served[type] = g_bytes_ref(bytes);
         g_output_stream_write_all_async(ps->stream, buf, len, G_PRIORITY_DEFAULT,
                                         NULL, data_control_send_written_cb, bytes);
         ps->stream = NULL; /* the async write owns it now */
@@ -758,6 +913,9 @@ void vdagent_clipboard_release(VDAgentClipboards *c, guint sel_id)
     vdagent_x11_clipboard_release(c->x11, sel_id);
 #else
     g_return_if_fail(sel_id < SELECTION_COUNT);
+    /* Whatever the client held, it holds no longer; an echo check still in
+     * flight will now find nothing to match and announce the guest's offer. */
+    clipboard_served_clear(&c->selections[sel_id]);
     if (c->selections[sel_id].owner != OWNER_CLIENT)
         return;
 
@@ -782,6 +940,8 @@ void vdagent_clipboards_release_all(VDAgentClipboards *c)
 
     for (sel_id = 0; sel_id < SELECTION_COUNT; sel_id++) {
         owner = c->selections[sel_id].owner;
+        c->selections[sel_id].echo_check = NULL;
+        clipboard_served_clear(&c->selections[sel_id]);
         gboolean had_source = (c->selections[sel_id].source != NULL);
         clipboard_source_clear(c, sel_id);
         clipboard_new_owner(c, sel_id, OWNER_NONE);
